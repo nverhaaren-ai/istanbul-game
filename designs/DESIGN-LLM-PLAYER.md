@@ -4,12 +4,11 @@
 > engine through three sequential phases: a prerequisite refactor to eliminate the police
 > station temporary-relocation hack, extraction of a pure `is_valid_action()` predicate,
 > and implementation of candidate generators feeding a `legal_actions()` API plus a
-> `describe()` state snapshot. Several action types encode parameters that are either
-> resolved externally (dice rolls, market demand draws) or represent open choices too
-> numerous to enumerate (fountain recall subsets, sultan's palace wildcard goods); a
-> consistent sentinel value strategy for these needs to be agreed on before implementation
-> begins, as it touches both the action data model and the game runner flow. No other
-> external decisions are needed to start Phase 0.
+> `describe()` state snapshot. Sentinel values are used only for genuinely random
+> externally-resolved parameters (dice rolls, demand card draws); all other parameters
+> are enumerated in full. One open design question must be resolved before Phase 2
+> implementation: the multi-step interaction protocol for dice-dependent red tile
+> decisions at the Tea House and Black Market (see "Dice and red tile sequencing" below).
 
 This document describes the plan for enabling an LLM to act as one or more players
 in the Istanbul game engine. The approach is to expose a `legal_actions()` API that
@@ -123,13 +122,13 @@ The validator has two layers, mirroring the existing two-level validation:
 | `GenericTileAction` at WAINWRIGHT | lira >= 7; cart_max < 5; extensions remaining |
 | `GenericTileAction` at GEMSTONE_DEALER | `dealer_state.cost is not None`; lira >= cost |
 | `GenericTileAction` at FOUNTAIN | at Fountain |
+| `FountainAction(locs)` | at Fountain; `locs ⊆ player.assistant_locations`; `locs` non-empty |
 | `MosqueAction(good)` | at mosque; player lacks that tile; mosque has that tile available; player has enough goods |
-| `BlackMarketAction(good, roll)` | at Black Market; if RedTileAction roll: has red tile |
+| `BlackMarketAction(good, roll)` | at Black Market; if RedTileAction roll: has red tile; roll sentinel accepted |
 | `CaravansaryAction(gains, cost)` | at Caravansary; has `cost` card; discard pile depth >= count of DISCARD gains; not awaiting_discard |
-| `MarketAction(goods, new_demand)` | at Small or Large Market; player has those goods; goods ≤ demand for each type; not expecting_demand |
-| `TeaHouseAction(call, roll)` | at Tea House; call in {3..12}; if RedTileAction roll: has red tile |
-| `SultansPalaceAction(goods)` | at Sultan's Palace; `required()` not None; player has enough goods matching requirement |
-| `FountainAction(locs)` | at Fountain; `locs ⊆ player.assistant_locations` |
+| `MarketAction(goods, new_demand)` | at Small or Large Market; player has those goods; goods ≤ demand for each type; not expecting_demand; new_demand sentinel accepted |
+| `TeaHouseAction(call, roll)` | at Tea House; call in {3..12}; if RedTileAction roll: has red tile; roll sentinel accepted |
+| `SultansPalaceAction(goods)` | at Sultan's Palace; `required()` not None; goods satisfies required count and per-good minimums |
 | `PoliceStationAction(location, sub)` | at Police Station; player has family at police station; location != police_station; `_can_do_tile_action_at(sub, location)` |
 | `SkipTileAction` | always valid in phase 3 |
 | `GreenTileAction(good)` | has GREEN tile; at a warehouse tile; lira >= 2 |
@@ -137,15 +136,20 @@ The validator has two layers, mirroring the existing two-level validation:
 | `DoubleCardAction(card, actions)` | has the card; at the right tile; each sub-action independently valid at that tile |
 
 **Phase 4 actions:**
-- `EncounterGovernor(gain, cost, roll)`: governor at current tile; if cost is Pay: lira >= 2; if cost is Card: has that card
-- `EncounterSmuggler(gain, cost, roll)`: smuggler at current tile; if cost is Pay: lira >= 2; if cost is Good: has that good in cart
+- `EncounterGovernor(gain, cost, roll)`: governor at current tile; if cost is Pay: lira >= 2; if cost is Card: has that card; roll sentinel accepted
+- `EncounterSmuggler(gain, cost, roll)`: smuggler at current tile; if cost is Pay: lira >= 2; if cost is Good: has that good in cart; roll sentinel accepted
 
 ### Implementation note
 
 `_can_do_tile_action_at(action, location) -> bool` is a private helper that performs
 phase 3 validation at an arbitrary location (used both by the main validator and by the
-PoliceStationAction validator for its sub-action). This directly mirrors
+PoliceStationAction validator for its sub-action). It directly mirrors
 `_execute_tile_action_at` in structure.
+
+Because a police station sub-action can itself be a dice-bearing action (e.g.,
+`TeaHouseAction(call, UNRESOLVED_ROLL)` sent via the police station), `_can_do_tile_action_at`
+must apply the same sentinel-skipping logic as the top-level validator — it must accept
+sentinel values in roll and demand parameters without treating them as invalid.
 
 ---
 
@@ -156,6 +160,24 @@ PoliceStationAction validator for its sub-action). This directly mirrors
 `_candidate_actions()` generates a superset of plausible actions for the current
 phase, without worrying about whether all of them pass validation. The validator is
 the source of correctness; the generator just needs to cover all possibilities.
+
+### Sentinel strategy
+
+Sentinel values are used **only** for parameters that are resolved by external physical
+mechanisms (dice rolls, demand card draws from the physical deck). Everything else —
+including goods combinations at Sultan's Palace, fountain recall subsets, and market
+goods selections — is enumerated in full. This keeps the legal_actions list concrete and
+complete, allowing the LLM to make informed strategic choices across all dimensions of
+each action.
+
+A module-level `UNRESOLVED_ROLL` and `UNRESOLVED_DEMAND` constant (typed appropriately)
+should be defined before implementation. The validator accepts these in roll and demand
+parameter positions without performing the specific-value checks that apply to real values.
+
+| Sentinel | Used in | Who resolves it |
+|----------|---------|-----------------|
+| `UNRESOLVED_ROLL` | `TeaHouseAction.roll`, `BlackMarketAction.roll`, `EncounterGovernor.roll`, `EncounterSmuggler.roll` | Game runner after LLM picks intent |
+| `UNRESOLVED_DEMAND` | `MarketAction.new_demand` | Game runner draws demand card after trade |
 
 ### By phase
 
@@ -184,8 +206,8 @@ the source of correctness; the generator just needs to cover all possibilities.
 
 **Phase 4 / outstanding rewards:**
 - If `outstanding_reward_choices > 0`: `ChooseReward(LIRA)` + `ChooseReward(card)` for each Card
-- If governor at tile: `EncounterGovernor(...)` — see note on rolls below
-- If smuggler at tile: `EncounterSmuggler(...)` — see note on rolls below
+- If governor at tile: `EncounterGovernor(gain, cost, UNRESOLVED_ROLL)` for each `Card` gain × each (Card in hand + `Pay`) as cost
+- If smuggler at tile: `EncounterSmuggler(gain, cost, UNRESOLVED_ROLL)` for each `Good` gain × each (Good with > 0 in cart + `Pay`) as cost
 - `YieldTurn()`
 - Phase-all cards
 
@@ -202,54 +224,55 @@ the source of correctness; the generator just needs to cover all possibilities.
 | POST_OFFICE | `GenericTileAction()` |
 | FABRIC / SPICE / FRUIT WAREHOUSE | `GenericTileAction()` |
 | WAINWRIGHT | `GenericTileAction()` |
-| FOUNTAIN | `FountainAction(RECALL_ALL)` sentinel entry only (players can have up to 5 assistants in the field, making full subset enumeration impractical) |
+| FOUNTAIN | `GenericTileAction()` (recall all); `FountainAction(subset)` for each non-empty proper subset of `assistant_locations` (up to 2^5 − 1 = 31 subsets; tractable) |
 | GEMSTONE_DEALER | `GenericTileAction()` |
 | GREAT_MOSQUE / SMALL_MOSQUE | `MosqueAction(good)` for each Good available at that mosque |
-| BLACK_MARKET | `BlackMarketAction(good, roll)` for each of {RED, GREEN, YELLOW} — roll is a placeholder (see below) |
+| BLACK_MARKET | `BlackMarketAction(good, UNRESOLVED_ROLL)` for each of {RED, GREEN, YELLOW} |
 | CARAVANSARY | `CaravansaryAction(gains, cost)` for each card in hand as cost, each valid gain combination |
-| SMALL_MARKET / LARGE_MARKET | `MarketAction(goods, new_demand)` for each non-empty subset of (player goods ∩ demand) — `new_demand` is a placeholder (see below) |
-| TEA_HOUSE | `TeaHouseAction(call, roll)` for call in {3..12} — roll is a placeholder (see below) |
-| SULTANS_PALACE | `SultansPalaceAction(AUTO_GOODS)` sentinel entry (wildcard slots make enumerating valid combinations complex; runner resolves goods) |
+| SMALL_MARKET / LARGE_MARKET | `MarketAction(goods, UNRESOLVED_DEMAND)` for each non-empty subset of (player goods ∩ demand) |
+| TEA_HOUSE | `TeaHouseAction(call, UNRESOLVED_ROLL)` for call in {3..12} |
+| SULTANS_PALACE | `SultansPalaceAction(goods)` for each valid `Counter[Good]` satisfying `required()` given player's cart contents (see note) |
 | POLICE_STATION | `PoliceStationAction(loc, sub)` for each non-police-station location × each valid sub-action candidate at that tile |
 
-### Sentinel values for open or externally-resolved parameters
+**Sultan's Palace goods enumeration:** When `required()` contains `None` wildcard slots,
+multiple goods combinations are valid (any good can fill a wildcard). With 4 good types,
+a cart max of 5 per good, and a small number of wildcards (the count grows slowly as
+`required_count` increases), the set of valid combinations is tractable. Enumerate all
+`Counter[Good]` that satisfy: total count equals `required_count`; for each specific Good
+`g` in `required()`, counter includes at least `required[g]` of `g`; for each Good `g`,
+counter does not exceed `cart_contents[g]`.
 
-Several action types contain parameters that are either resolved by external game
-mechanics (dice, drawn cards) or represent choices that are too numerous to enumerate
-cleanly in a legal-actions list. For all of these the `legal_actions()` API uses a
-named sentinel value in place of the actual parameter. The validator treats any sentinel
-as vacuously valid for that parameter slot; the game runner fills in real values before
-calling `take_action()`.
+### Dice and red tile sequencing (open design question)
 
-A module-level `SENTINEL` marker (or per-field constants) should be defined before
-implementation begins so that all action types use a consistent approach.
+Several actions encode both a player intent and a random dice outcome in a single
+object: `TeaHouseAction(call, roll)`, `BlackMarketAction(good, roll)`. The sentinel
+approach handles the common case: the LLM picks the intent, dice are rolled externally,
+the runner constructs the final action.
 
-| Action | Sentinel parameter | Who resolves it |
-|--------|--------------------|-----------------|
-| `TeaHouseAction.roll` | `UNRESOLVED_ROLL` | Game runner rolls dice after LLM picks `call` |
-| `BlackMarketAction.roll` | `UNRESOLVED_ROLL` | Game runner rolls dice after LLM picks good |
-| `EncounterGovernor.roll` | `UNRESOLVED_ROLL` | Game runner rolls dice |
-| `EncounterSmuggler.roll` | `UNRESOLVED_ROLL` | Game runner rolls dice |
-| `MarketAction.new_demand` | `UNRESOLVED_DEMAND` | Game runner draws demand card after trade |
-| `FountainAction.assistant_locations` | `RECALL_ALL` | Validator/handler reads all player assistant locations |
-| `SultansPalaceAction.goods` | `AUTO_GOODS` | Game runner (or handler) picks any valid goods combination from player's cart |
+The complication arises when the player has the **red tile**: after seeing the dice
+result, the player may modify one die (set to 4) or reroll both. This decision is
+strategically dependent on the actual roll, so it cannot be made at the same time as
+the intent. The options are:
 
-**Fountain:** A player may have up to 5 assistants on the board (starting stack of 4,
-+1 from the Blue mosque tile), yielding up to 32 possible subset choices. Enumerating
-all subsets adds noise without benefit to the LLM. `legal_actions()` returns a single
-`FountainAction(RECALL_ALL)` sentinel entry; if partial recall is ever needed the LLM
-can request it via a separate mechanism.
+1. **Two-query protocol:** LLM picks intent (`TeaHouseAction(call=7, UNRESOLVED_ROLL)`),
+   runner resolves dice, runner re-queries the LLM with the dice result and asks whether
+   to use the red tile. The engine still receives a single atomic action; the splitting
+   is at the runner/integration layer only. No changes to action types or JSON schema.
 
-**Sultan's Palace wildcards:** When `required_count` exceeds 4 the requirement includes
-`None` wildcard slots (any good). The LLM does not need to reason about which specific
-good fills each wildcard; `AUTO_GOODS` signals the runner to pick any valid combination
-from the player's cart.
+2. **Upfront red tile declaration:** LLM is asked to commit to both the intent and red
+   tile usage before dice are rolled (e.g., "I'll call 7 and use red tile to set-to-4 if
+   I roll below 4 on either die"). The runner resolves this rule-based. Simpler runner,
+   but requires specifying a conditional rather than a direct choice, which may be
+   awkward for the LLM.
 
-**Validator behaviour:** The validator skips the specific-value checks for sentinel
-slots (e.g., roll validation, demand validation, goods-match validation) and only checks
-the non-sentinel preconditions (correct tile, sufficient resources, etc.). This must be
-documented clearly so future implementors do not accidentally tighten the validator
-to reject sentinels.
+3. **Intermediate engine actions:** Split `TeaHouseAction` into a call-action and a
+   separate optional roll-modification action. Cleaner conceptually but requires changes
+   to action types, the JSON schema, and the existing runner/replay machinery.
+
+Option 1 is the path of least resistance and preserves all existing engine behaviour.
+Option 3 is the cleanest long-term design but has significant scope. **This choice must
+be made before Phase 2 implementation begins** since it affects the action types used
+in candidate generation.
 
 ---
 
@@ -263,20 +286,56 @@ def legal_actions(self) -> list[PlayerAction]:
     return [a for a in self._candidate_actions() if self.is_valid_action(a)]
 ```
 
-### Game state description
+### Game state description — `describe()`
 
-Add `GameState.describe() -> dict` (or a dedicated dataclass) producing a
-structured, LLM-readable snapshot of the current state. At minimum:
+Add `GameState.describe() -> dict` producing a structured snapshot of the current state.
+The format should be serialisable (JSON-compatible) and complete enough that an LLM can
+reason about strategy without access to any other state.
 
-- Current player, phase, lira, rubies, cart contents, cards in hand, assistant locations
-- Current tile and what can be done there (synthesised from tile state)
-- Other players: locations, rubies (public information)
-- Board: governor/smuggler locations, market demands, mosque tile costs, post office position
-- Outstanding reward choices if any
+**Fields:**
+```
+current_player:
+  color, phase, lira, rubies
+  cart: {red, blue, green, yellow, cart_max}
+  hand: {card_name: count, ...}
+  assistant_locations: [location_numbers]
+  family_location: location_number
 
-The exact format (dict, dataclass, or string) can be decided at implementation time;
-the important thing is that it is computed from the same `GameState` fields as the
-validator, so it cannot go stale.
+other_players: [{color, location, rubies}, ...]   # public info only
+
+board:
+  governor_location: location_number
+  smuggler_location: location_number
+  tile_layout: {location_number: tile_name, ...}
+
+tiles:
+  small_market: {demand: {good: count}, one_cost: int}
+  large_market: {demand: {good: count}, one_cost: int}
+  post_office: {position: int, next_goods: [good_names], next_lira: int}
+  great_mosque: {available_tiles: {good: cost}, ...}
+  small_mosque: {available_tiles: {good: cost}, ...}
+  sultans_palace: {required_count: int, required: {good: count}}
+  gemstone_dealer: {cost: int | null}
+  wainwright: {extensions_remaining: int}
+  caravansary: {discard_pile_top: card_name | null}
+
+outstanding_reward_choices: int
+```
+
+### LLM prompt guide
+
+In addition to `describe()`, the integration layer should provide a static markdown
+explanation of the action format and sentinel values as part of the system prompt or
+alongside the legal actions list. At minimum it should explain:
+
+- What `UNRESOLVED_ROLL` means and that the runner will prompt for the dice result
+- What `UNRESOLVED_DEMAND` means and that the new demand will be input after the trade
+- How to interpret `FountainAction(locations)` vs `GenericTileAction()` at the Fountain
+- The two-step resolution protocol for red tile decisions (once that is resolved above)
+
+The legal actions list itself may also be offered as full enumeration on request — if
+the LLM's response does not match a legal action, the runner can re-query with the
+explicit list rather than failing immediately.
 
 ---
 
